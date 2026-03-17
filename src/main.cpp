@@ -425,7 +425,6 @@ g_frameBuf = (uint16_t *)heap_caps_malloc(240 * 240 * sizeof(uint16_t), MALLOC_C
     int32_t elapsed = (int32_t)(::millis() - frameStart);
     int32_t remaining = 16 - elapsed;
     if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(remaining));
-    continue;
     }
 
     size_t imageSize = 0;
