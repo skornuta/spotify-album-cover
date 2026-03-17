@@ -498,7 +498,7 @@ static void spotifyWorkerTask(void *param) {
       continue;
     }
 
-    if (trackId == g_lastTrackId && albumUrl == g_lastAlbumUrl) {
+    if (trackId == g_lastTrackId) {
       Serial.println("Task: same track/art, skipping redraw");
       vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
       continue;
