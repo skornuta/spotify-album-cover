@@ -8,7 +8,6 @@
 #include "secrets.h"
 #include "esp_task_wdt.h"
 
-
 using namespace lgfx;
 
 // ---- Pins / constants ----
@@ -102,12 +101,19 @@ static LGFX tft;
 static int16_t  g_imageX        = 0;
 static int16_t  g_imageY        = 0;
 static float    g_spinAngle     = 0.0f;
-static uint16_t *g_frameBuf = nullptr;
+static uint16_t *g_frameBuf     = nullptr;
 
 static String   g_accessToken;
 static uint32_t g_tokenExpiresAtMs = 0;
 static String   g_lastAlbumUrl;
 static String   g_lastTrackId;
+
+// NEW: track metadata and timing
+static String   g_lastTrackName;
+static String   g_lastArtistName;
+static uint32_t g_progressMs   = 0;
+static uint32_t g_durationMs   = 0;
+static uint32_t g_lastUpdateMs = 0;
 
 // ---- Helpers: base64 + URL encode ----
 static String base64Encode(const String &in) {
@@ -163,22 +169,85 @@ static bool tftJpgOutput(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t 
   return true;
 }
 
+// NEW: simple status screen
+static void drawStatusScreen(const char *line1, const char *line2) {
+  tft.fillScreen(TFT_BLACK);
+  tft.setTextDatum(middle_center);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(1);
+  tft.drawString(line1, tft.width() / 2, tft.height() / 2 - 8);
+  if (line2 && line2[0]) {
+    tft.setTextColor(tft.color565(160,160,160), TFT_BLACK);
+    tft.drawString(line2, tft.width() / 2, tft.height() / 2 + 10);
+  }
+}
+
+// NEW: track title / artist overlay
+static void drawTrackOverlay()
+{
+  const int16_t w    = tft.width();
+  const int16_t h    = tft.height();
+  const int16_t barH = 40;
+
+  uint16_t barColor = tft.color565(10, 10, 10);
+  tft.fillRect(0, h - barH, w, barH, barColor);
+
+  tft.setTextDatum(top_center);
+  tft.setTextSize(1);
+
+  tft.setTextColor(TFT_WHITE, barColor);
+  tft.drawString(g_lastTrackName, w / 2, h - barH + 4);
+
+  tft.setTextColor(tft.color565(180, 180, 180), barColor);
+  tft.drawString(g_lastArtistName, w / 2, h - barH + 20);
+}
+
+
+// NEW: outer progress ring
+static void drawProgressRing() {
+  if (g_durationMs == 0) return;
+
+  float ratio = (float)g_progressMs / (float)g_durationMs;
+  if (ratio < 0.0f) ratio = 0.0f;
+  if (ratio > 1.0f) ratio = 1.0f;
+
+  const int16_t cx = 120, cy = 120;
+  const int16_t rOuter = 118;
+  const int16_t rInner = 112;
+
+  uint16_t bgColor = tft.color565(25, 25, 25);
+  uint16_t fgColor = tft.color565(0, 200, 120);
+
+  // Background ring
+  tft.drawCircle(cx, cy, rOuter, bgColor);
+  tft.drawCircle(cx, cy, rInner, bgColor);
+
+  // Foreground arc
+  int segments = 120; // 3° steps
+  for (int i = 0; i < segments * ratio; ++i) {
+    float ang = (float)i / segments * 2.0f * M_PI - M_PI_2;
+    int16_t x0 = cx + cosf(ang) * rInner;
+    int16_t y0 = cy + sinf(ang) * rInner;
+    int16_t x1 = cx + cosf(ang) * rOuter;
+    int16_t y1 = cy + sinf(ang) * rOuter;
+    tft.drawLine(x0, y0, x1, y1, fgColor);
+  }
+}
+
 // ---- Spinning record draw ----
 static void drawSpinningRecord() {
-    const int16_t cx = 120, cy = 120, r = 118;
+    const int16_t cx = 120, cy = 110, r = 100;
 
-    g_spinAngle += 1.5f;                        // ✅ increment FIRST
-    g_spinAngle = fmodf(g_spinAngle, 360.0f);  // then wrap
+    g_spinAngle += 1.5f;
+    g_spinAngle = fmodf(g_spinAngle, 360.0f);
 
-    float rad = g_spinAngle * (M_PI / 180.0f);
+    float rad  = g_spinAngle * (M_PI / 180.0f);
     float cosA = cosf(rad), sinA = sinf(rad);
 
-    // Row buffer — max width is 2*r
     static uint16_t rowBuf[240];
 
     tft.startWrite();
     for (int16_t py = -r; py <= r; py++) {
-        // Find the horizontal span of the circle at this row
         int16_t halfW = (int16_t)sqrtf((float)(r * r - py * py));
         int16_t x0 = cx - halfW;
         int16_t x1 = cx + halfW;
@@ -196,21 +265,11 @@ static void drawSpinningRecord() {
                         : TFT_BLACK;
         }
 
-        // Push entire scanline in one SPI burst
         tft.setAddrWindow(x0, cy + py, len, 1);
         tft.pushPixels(rowBuf, len);
     }
-
-    // Center spindle
-    tft.fillCircle(cx, cy, 18, tft.color565(30, 30, 30));
-    tft.drawCircle(cx, cy, 18, tft.color565(60, 60, 60));
-    tft.fillCircle(cx, cy, 10, tft.color565(180, 180, 180));
-    tft.fillCircle(cx, cy, 7,  tft.color565(220, 220, 220));
-    tft.fillCircle(cx, cy, 4,  tft.color565(140, 140, 140));
-    tft.fillCircle(cx, cy, 2,  TFT_BLACK);
     tft.endWrite();
 }
-
 
 // ---- WiFi ----
 static bool connectWifiWithRetries() {
@@ -259,7 +318,7 @@ static bool refreshSpotifyToken() {
   StaticJsonDocument<768> doc;
   if (deserializeJson(doc, body)) return false;
 
-  const char *token = doc["access_token"];
+  const char *token      = doc["access_token"];
   const uint32_t expiresIn = doc["expires_in"] | 3600;
   if (!token || token[0] == '\0') return false;
 
@@ -277,8 +336,16 @@ static bool ensureValidToken() {
 }
 
 // ---- Spotify currently-playing ----
-static bool fetchCurrentlyPlaying(String &trackId, String &albumUrl, bool &hasTrack) {
+static bool fetchCurrentlyPlaying(String &trackId,
+                                  String &albumUrl,
+                                  bool &hasTrack,
+                                  String &trackName,
+                                  String &artistName,
+                                  uint32_t &progressMs,   // NEW
+                                  uint32_t &durationMs) { // NEW
   trackId = ""; albumUrl = ""; hasTrack = false;
+  trackName = ""; artistName = "";
+  progressMs = 0; durationMs = 0;
 
   if (WiFi.status() != WL_CONNECTED || g_accessToken.isEmpty()) return false;
 
@@ -303,14 +370,23 @@ static bool fetchCurrentlyPlaying(String &trackId, String &albumUrl, bool &hasTr
 
   StaticJsonDocument<192> filter;
   filter["item"]["id"] = true;
+  filter["item"]["name"] = true;
+  filter["item"]["artists"][0]["name"] = true;
   filter["item"]["album"]["images"][0]["url"] = true;
   filter["item"]["album"]["images"][1]["url"] = true;
+  filter["progress_ms"] = true;                // NEW
+  filter["item"]["duration_ms"] = true;        // NEW
 
   StaticJsonDocument<2048> doc;
   if (deserializeJson(doc, body, DeserializationOption::Filter(filter))) return false;
 
-  const char *id = doc["item"]["id"] | "";
+  const char *id   = doc["item"]["id"]   | "";
+  const char *name = doc["item"]["name"] | "";
+  const char *art  = doc["item"]["artists"][0]["name"] | "";
   JsonArray images = doc["item"]["album"]["images"].as<JsonArray>();
+
+  uint32_t prog = doc["progress_ms"] | 0;
+  uint32_t dur  = doc["item"]["duration_ms"] | 0;
 
   if (!id || id[0] == '\0' || images.isNull() || images.size() == 0) return true;
 
@@ -320,7 +396,13 @@ static bool fetchCurrentlyPlaying(String &trackId, String &albumUrl, bool &hasTr
 
   if (!url || url[0] == '\0') return true;
 
-  trackId = id; albumUrl = url; hasTrack = true;
+  trackId    = id;
+  albumUrl   = url;
+  trackName  = name;
+  artistName = art;
+  progressMs = prog;
+  durationMs = dur;
+  hasTrack   = true;
   return true;
 }
 
@@ -373,110 +455,234 @@ static bool downloadImageToBuffer(const String &url, uint8_t *buffer,
   Serial.printf("Image: downloaded %u bytes\n", static_cast<unsigned>(imageSize));
   return true;
 }
+// Spinner globals + forward declarations
+static float g_spinnerAngle = 0.0f;
+static bool  g_spinnerInit  = false;
+
+static void drawSpinnerFrame();
+static void runStartupSpinnerOnce();
 
 // ---- Worker task ----
 static void spotifyWorkerTask(void *param) {
   (void)param;
 
-// After (prefer PSRAM, fall back to any available):
-uint8_t *imageBuffer = (uint8_t *)heap_caps_malloc(MAX_IMAGE_BYTES, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
-g_frameBuf = (uint16_t *)heap_caps_malloc(240 * 240 * sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
-
-
+  uint8_t *imageBuffer = (uint8_t *)heap_caps_malloc(MAX_IMAGE_BYTES, MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
+  g_frameBuf = (uint16_t *)heap_caps_malloc(240 * 240 * sizeof(uint16_t), MALLOC_CAP_8BIT | MALLOC_CAP_SPIRAM);
 
   uint32_t lastWifiRetry = 0;
 
   for (;;) {
     if (WiFi.status() != WL_CONNECTED) {
-      if (::millis() - lastWifiRetry >= WIFI_RETRY_DELAY_MS) {
-        lastWifiRetry = ::millis();
-        connectWifiWithRetries();
-      }
-      vTaskDelay(pdMS_TO_TICKS(500));
-      continue;
-    }
+  // animate spinner + text while waiting
+  const int16_t cx = 120;
+  const int16_t cy = 120;
+
+      drawSpinnerFrame();
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(TFT_WHITE, TFT_BLACK);
+    tft.drawString("Connecting WiFi...", cx, cy);   // centered
+
+  if (::millis() - lastWifiRetry >= WIFI_RETRY_DELAY_MS) {
+    lastWifiRetry = ::millis();
+    connectWifiWithRetries();
+  }
+
+  vTaskDelay(pdMS_TO_TICKS(16));  // ~60 FPS spinner
+  continue;
+}
+
 
     if (!ensureValidToken()) {
-      Serial.println("Task: token unavailable, will retry");
-      vTaskDelay(pdMS_TO_TICKS(3000));
-      continue;
-    }
+  Serial.println("Task: token unavailable, will retry");
 
-    String trackId, albumUrl;
+  const int16_t cx = 120;
+  const int16_t cy = 120;
+
+  drawSpinnerFrame();
+  tft.setTextDatum(middle_center);
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.drawString("Connecting Spotify...", cx, cy);
+  vTaskDelay(pdMS_TO_TICKS(200));
+  continue;
+}
+
+
+
+    String trackId, albumUrl, trackName, artistName;
     bool   hasTrack = false;
+    uint32_t progressMs = 0, durationMs = 0;
 
-    if (!fetchCurrentlyPlaying(trackId, albumUrl, hasTrack)) {
+    if (!fetchCurrentlyPlaying(trackId, albumUrl, hasTrack,
+                               trackName, artistName,
+                               progressMs, durationMs)) {
       Serial.println("Task: currently-playing fetch failed");
+      drawStatusScreen("Spotify error", "Retrying..."); // NEW
       vTaskDelay(pdMS_TO_TICKS(3000));
       continue;
     }
 
     if (!hasTrack) {
       Serial.println("Task: nothing currently playing");
+      drawStatusScreen("Nothing playing", "Open Spotify"); // NEW
       vTaskDelay(pdMS_TO_TICKS(POLL_INTERVAL_MS));
       continue;
     }
 
     if (trackId == g_lastTrackId && albumUrl == g_lastAlbumUrl) {
-      // Same track — just keep spinning without re-downloading
-      uint32_t frameStart = ::millis();
-    drawSpinningRecord();
-    esp_task_wdt_reset();  // ✅ feed the watchdog
-    int32_t elapsed = (int32_t)(::millis() - frameStart);
-    int32_t remaining = 16 - elapsed;
-    if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(remaining));
-    continue;
-    }
+  // Same track — just keep spinning without re-downloading
+  if (g_durationMs > 0) {
+    uint32_t delta = ::millis() - g_lastUpdateMs;
+    g_lastUpdateMs += delta;
+    uint64_t p = (uint64_t)g_progressMs + delta;
+    if (p > g_durationMs) p = g_durationMs;
+    g_progressMs = (uint32_t)p;
+  }
+
+  uint32_t frameStart = ::millis();
+  drawSpinningRecord();
+  drawProgressRing();
+  drawTrackOverlay();        // <- add this
+  esp_task_wdt_reset();
+  int32_t elapsed   = (int32_t)(::millis() - frameStart);
+  int32_t remaining = 16 - elapsed;
+  if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(remaining));
+  continue;
+}
+
 
     size_t imageSize = 0;
     if (!downloadImageToBuffer(albumUrl, imageBuffer, MAX_IMAGE_BYTES, imageSize)) {
       Serial.println("Task: image download failed");
+      drawStatusScreen("Image download", "Failed"); // NEW
       vTaskDelay(pdMS_TO_TICKS(3000));
       continue;
     }
 
-    // Decode JPEG into g_frameBuf via callback
     memset(g_frameBuf, 0, 240 * 240 * sizeof(uint16_t));
-    g_imageX = (240 - 150) / 2;  // = 45
-    g_imageY = (240 - 150) / 2;  // = 45
+    g_imageX = (240 - 150) / 2;
+    g_imageY = (240 - 150) / 2;
     TJpgDec.setJpgScale(JPG_SCALE);
     JRESULT res = TJpgDec.drawJpg(0, 0, imageBuffer, imageSize);
 
     if (res != JDR_OK) {
       Serial.printf("Task: JPEG decode failed (%d)\n", (int)res);
+      drawStatusScreen("JPEG decode", "Failed"); // NEW
       vTaskDelay(pdMS_TO_TICKS(3000));
       continue;
     }
 
-    g_lastTrackId  = trackId;
-    g_lastAlbumUrl = albumUrl;
+    g_lastTrackId    = trackId;
+    g_lastAlbumUrl   = albumUrl;
+    g_lastTrackName  = trackName;
+    g_lastArtistName = artistName;
+    g_progressMs     = progressMs;
+    g_durationMs     = durationMs;
+    g_lastUpdateMs   = ::millis();
 
     Serial.println("Task: decoded OK, spinning...");
 
-    // Spin loop — poll for track change every POLL_INTERVAL_MS
+
     uint32_t lastPoll = ::millis();
     for (;;) {
+      // approximate progress
+      if (g_durationMs > 0) {
+        uint32_t delta = ::millis() - g_lastUpdateMs;
+        g_lastUpdateMs += delta;
+        uint64_t p = (uint64_t)g_progressMs + delta;
+        if (p > g_durationMs) p = g_durationMs;
+        g_progressMs = (uint32_t)p;
+      }
+
       uint32_t frameStart = ::millis();
-    drawSpinningRecord();
-    esp_task_wdt_reset();  // ✅ feed the watchdog
-    int32_t elapsed = (int32_t)(::millis() - frameStart);
-    int32_t remaining = 16 - elapsed;
-    if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(remaining));
+      drawSpinningRecord();
+      drawProgressRing();
+      drawTrackOverlay();  
+      esp_task_wdt_reset();
+      int32_t elapsed   = (int32_t)(::millis() - frameStart);
+      int32_t remaining = 16 - elapsed;
+      if (remaining > 0) vTaskDelay(pdMS_TO_TICKS(remaining));
 
       if (::millis() - lastPoll >= POLL_INTERVAL_MS) {
         lastPoll = ::millis();
-        String newTrackId, newAlbumUrl;
+        String newTrackId, newAlbumUrl, newTrackName, newArtistName;
         bool   newHasTrack = false;
+        uint32_t newProgressMs = 0, newDurationMs = 0;
+
         if (ensureValidToken() &&
-            fetchCurrentlyPlaying(newTrackId, newAlbumUrl, newHasTrack) &&
+            fetchCurrentlyPlaying(newTrackId, newAlbumUrl, newHasTrack,
+                                  newTrackName, newArtistName,
+                                  newProgressMs, newDurationMs) &&
             newHasTrack &&
             (newTrackId != g_lastTrackId || newAlbumUrl != g_lastAlbumUrl)) {
-          break; // new track — exit spin loop, re-download art
+          break;
         }
       }
     }
   }
 }
+
+
+
+static void drawSpinnerFrame()
+{
+  const int16_t cx = 120;
+  const int16_t cy = 120;
+  const int16_t rOuter = 90;
+  const int16_t rInner = 70;
+
+  uint16_t bgColor  = TFT_BLACK;
+  uint16_t ringCol  = tft.color565(0x1D, 0xB9, 0x54);
+  uint16_t textCol  = tft.color565(220, 220, 220);
+
+  if (!g_spinnerInit) {
+    tft.fillScreen(bgColor);
+    tft.setTextDatum(middle_center);
+    tft.setTextSize(1);
+    tft.setTextColor(textCol, bgColor);
+    tft.drawString("Spotify Player", cx, cy + 60);
+    g_spinnerInit = true;
+  }
+
+  // Clear logo area only
+  tft.fillCircle(cx, cy, rOuter + 4, bgColor);
+
+  // Static outer ring
+  tft.drawCircle(cx, cy, rOuter, ringCol);
+  tft.drawCircle(cx, cy, rInner, ringCol);
+
+  // Spinning "S" arc
+  for (int i = 0; i < 3; ++i) {
+    float a0 = g_spinnerAngle + i * 18.0f;
+    float a1 = a0 + 30.0f;
+
+    for (float a = a0; a <= a1; a += 2.0f) {
+      float rad  = a * (M_PI / 180.0f);
+      int16_t x0 = cx + cosf(rad) * rInner;
+      int16_t y0 = cy + sinf(rad) * rInner;
+      int16_t x1 = cx + cosf(rad) * rOuter;
+      int16_t y1 = cy + sinf(rad) * rOuter;
+      tft.drawLine(x0, y0, x1, y1, ringCol);
+    }
+  }
+
+  g_spinnerAngle += 8.0f;
+  if (g_spinnerAngle >= 360.0f) g_spinnerAngle -= 360.0f;
+}
+
+static void runStartupSpinnerOnce()
+{
+  g_spinnerInit = false;
+  uint32_t start = ::millis();
+  while (::millis() - start < 1000) {   // ~1 second
+    drawSpinnerFrame();
+    ::delay(16);
+  }
+  // Leave last spinner frame on screen; no clear here
+}
+
+
 
 // ---- Arduino setup/loop ----
 void setup() {
@@ -487,22 +693,13 @@ void setup() {
   tft.setRotation(0);
   tft.setBrightness(255);
   tft.fillScreen(TFT_BLACK);
-  tft.setTextColor(TFT_WHITE, TFT_BLACK);
-  tft.setTextDatum(middle_center);
-  tft.drawString("Starting...", tft.width() / 2, tft.height() / 2);
 
   TJpgDec.setCallback(tftJpgOutput);
   TJpgDec.setSwapBytes(true);
   TJpgDec.setJpgScale(JPG_SCALE);
 
-  if (DISPLAY_SELF_TEST) {
-    tft.fillScreen(TFT_RED);   ::delay(400);
-    tft.fillScreen(TFT_GREEN); ::delay(400);
-    tft.fillScreen(TFT_BLUE);  ::delay(400);
-    tft.fillScreen(TFT_BLACK);
-    tft.drawString("SPI OK?", tft.width() / 2, tft.height() / 2);
-    ::delay(800);
-  }
+  // NEW: run spinner for a second at boot
+  runStartupSpinnerOnce();
 
   xTaskCreatePinnedToCore(
       spotifyWorkerTask,
