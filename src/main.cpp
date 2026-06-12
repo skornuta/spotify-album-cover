@@ -38,9 +38,13 @@ static constexpr int PIN_BL   = -1;   // set to your backlight pin if wired
 
 // ---- Constants ----
 static constexpr uint32_t SPI_WRITE_FREQ   = 40000000;   // 40 MHz; raise to 80M on short wiring
-static constexpr uint32_t POLL_INTERVAL_MS = 8000;        // how often to ask Spotify
+static constexpr uint32_t POLL_INTERVAL_MS = 8000;        // normal poll cadence
+static constexpr uint32_t POLL_FAST_MS     = 1500;        // poll cadence when waiting / near track end
+static constexpr uint32_t NEAR_END_MS      = 12000;       // "near end" window -> poll fast
 static constexpr uint32_t RING_INTERVAL_MS = 250;         // progress ring refresh cadence
 static constexpr uint32_t OVERLAY_MS       = 5000;        // how long song/artist shows
+static constexpr uint32_t SPIN_INTERVAL_MS = 33;          // loading spinner frame time (~30 fps)
+static constexpr uint8_t  REVEAL_ROW_MS    = 9;           // per-row delay for the wipe-in reveal
 static constexpr uint32_t HTTP_TIMEOUT_MS  = 12000;
 static constexpr uint32_t WIFI_RETRY_MS    = 5000;
 static constexpr size_t   MAX_IMAGE_BYTES  = 98304;       // 96 KB; covers seen up to ~60 KB
@@ -148,6 +152,9 @@ static int16_t   g_jpgX = 0, g_jpgY = 0;
 static int16_t   g_clipTop = 0, g_clipBot = DISPLAY_H;
 // Ring incremental-draw state: filled sweep in degrees currently shown
 static float     g_ringDeg = 0.0f;
+// When true, the decode callback paces itself row-by-row for a wipe-in reveal.
+static bool      g_reveal     = false;
+static int16_t   g_revealLastY = INT16_MIN;
 
 // =====================================================================
 //  Small helpers: base64 + URL encoding
@@ -193,6 +200,24 @@ static void configureTls(WiFiClientSecure &client) {
   client.setInsecure();               // simplest reliable path; fine for this use
 #endif
   client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+}
+
+// One shared TLS client + HTTP client for ALL Spotify requests. Using a single
+// connection means only ONE mbedTLS context is ever live (each costs ~40 KB) --
+// critical on a no-PSRAM ESP32. begin() reconnects automatically when the host
+// changes, and keep-alive is reused for consecutive same-host polls.
+static WiFiClientSecure g_tls;
+static HTTPClient       g_http;
+
+static HTTPClient &http() {
+  static bool init = false;
+  if (!init) {
+    configureTls(g_tls);
+    g_http.setReuse(true);
+    g_http.setTimeout(HTTP_TIMEOUT_MS);
+    init = true;
+  }
+  return g_http;
 }
 
 // =====================================================================
@@ -280,6 +305,12 @@ static bool jpgToScreen(int16_t x, int16_t y, uint16_t w, uint16_t h, uint16_t *
   // Skip blocks outside the active vertical clip; pushImage clips x for us.
   if (y + (int)h <= g_clipTop || y >= g_clipBot) return true;
   tft.pushImage(x, y, w, h, bitmap);
+  // Reveal mode: brief pause when we move to a new row of blocks, so the new
+  // cover wipes in top-to-bottom instead of popping in all at once.
+  if (g_reveal && y != g_revealLastY) {
+    g_revealLastY = y;
+    tft.endWrite(); delay(REVEAL_ROW_MS); tft.startWrite();  // flush row, then pause
+  }
   return true;
 }
 
@@ -322,18 +353,15 @@ static bool refreshToken() {
   const String body =
       "grant_type=refresh_token&refresh_token=" + urlEncode(String(SPOTIFY_REFRESH_TOKEN));
 
-  WiFiClientSecure client;
-  configureTls(client);
-  HTTPClient http;
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, TOKEN_URL)) return false;
-  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
-  http.addHeader("Authorization", "Basic " + basic);
+  HTTPClient &h = http();
+  if (!h.begin(g_tls, TOKEN_URL)) return false;
+  h.addHeader("Content-Type", "application/x-www-form-urlencoded");
+  h.addHeader("Authorization", "Basic " + basic);
 
-  const int code = http.POST(body);
+  const int code = h.POST(body);
   if (code != 200) {
-    Serial.printf("Token: HTTP %d -> %s\n", code, http.getString().c_str());
-    http.end();
+    Serial.printf("Token: HTTP %d -> %s\n", code, h.getString().c_str());
+    h.end();
     return false;
   }
 
@@ -342,8 +370,8 @@ static bool refreshToken() {
   filter["expires_in"]   = true;
   StaticJsonDocument<512> doc;
   const DeserializationError err =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
+      deserializeJson(doc, h.getStream(), DeserializationOption::Filter(filter));
+  h.end();
   if (err) { Serial.printf("Token: JSON err %s\n", err.c_str()); return false; }
 
   const char *tok = doc["access_token"];
@@ -374,25 +402,21 @@ static NowPlaying fetchNowPlaying(String &trackId, String &albumUrl) {
   trackId = "";
   albumUrl = "";
 
-  static WiFiClientSecure client;     // persistent -> TLS session kept alive
-  static HTTPClient       http;
-  static bool             init = false;
-  if (!init) { configureTls(client); http.setReuse(true); init = true; }
+  HTTPClient &h = http();
+  if (!h.begin(g_tls, CURRENT_URL)) return NowPlaying::Error;
+  h.addHeader("Authorization", "Bearer " + g_accessToken);
 
-  if (!http.begin(client, CURRENT_URL)) return NowPlaying::Error;
-  http.addHeader("Authorization", "Bearer " + g_accessToken);
-
-  const int code = http.GET();
-  if (code == 204) { http.end(); return NowPlaying::Nothing; }   // nothing playing
+  const int code = h.GET();
+  if (code == 204) { h.end(); return NowPlaying::Nothing; }       // nothing playing
   if (code == 401) {                                              // token died early
-    http.end();
+    h.end();
     g_accessToken.clear();
     g_tokenExpiresAt = 0;
     return NowPlaying::Error;
   }
   if (code != 200) {
     Serial.printf("NowPlaying: HTTP %d\n", code);
-    http.end();
+    h.end();
     return NowPlaying::Error;
   }
 
@@ -409,8 +433,8 @@ static NowPlaying fetchNowPlaying(String &trackId, String &albumUrl) {
 
   StaticJsonDocument<1024> doc;
   const DeserializationError err =
-      deserializeJson(doc, http.getStream(), DeserializationOption::Filter(filter));
-  http.end();
+      deserializeJson(doc, h.getStream(), DeserializationOption::Filter(filter));
+  h.end();
   if (err) { Serial.printf("NowPlaying: JSON err %s\n", err.c_str()); return NowPlaying::Error; }
 
   const char *id = doc["item"]["id"] | "";
@@ -437,26 +461,23 @@ static NowPlaying fetchNowPlaying(String &trackId, String &albumUrl) {
 // =====================================================================
 static bool downloadImage(const String &url) {
   g_imageSize = 0;
-  WiFiClientSecure client;
-  configureTls(client);
-  HTTPClient http;
-  http.setTimeout(HTTP_TIMEOUT_MS);
-  if (!http.begin(client, url)) return false;
+  HTTPClient &h = http();
+  if (!h.begin(g_tls, url)) return false;
 
-  const int code = http.GET();
-  if (code != 200) { Serial.printf("Image: HTTP %d\n", code); http.end(); return false; }
+  const int code = h.GET();
+  if (code != 200) { Serial.printf("Image: HTTP %d\n", code); h.end(); return false; }
 
-  const int len = http.getSize();
+  const int len = h.getSize();
   if (len > (int)MAX_IMAGE_BYTES) {
     Serial.printf("Image: too big (%d > %u)\n", len, (unsigned)MAX_IMAGE_BYTES);
-    http.end();
+    h.end();
     return false;
   }
 
-  WiFiClient *stream = http.getStreamPtr();
+  WiFiClient *stream = h.getStreamPtr();
   size_t      got    = 0;
   uint32_t    lastRx = millis();
-  while (http.connected() && (len < 0 || (int)got < len)) {
+  while (h.connected() && (len < 0 || (int)got < len)) {
     const size_t avail = stream->available();
     if (avail) {
       size_t toRead = avail;
@@ -469,7 +490,7 @@ static bool downloadImage(const String &url) {
       delay(2);
     }
   }
-  http.end();
+  h.end();
 
   if (got == 0) { Serial.println("Image: empty"); return false; }
   g_imageSize = got;
@@ -480,7 +501,7 @@ static bool downloadImage(const String &url) {
 // =====================================================================
 //  Decode + render the cached JPEG (whole screen, or just a vertical band)
 // =====================================================================
-static bool decodeBand(int16_t top, int16_t bottom) {
+static bool decodeBand(int16_t top, int16_t bottom, bool reveal = false) {
   if (g_imageSize == 0) return false;
 
   uint16_t w = 0, h = 0;
@@ -502,6 +523,8 @@ static bool decodeBand(int16_t top, int16_t bottom) {
   g_jpgY = (DISPLAY_H - sh) / 2;
   g_clipTop = top;
   g_clipBot = bottom;
+  g_reveal      = reveal;
+  g_revealLastY = INT16_MIN;
 
   tft.startWrite();
   const JRESULT r = TJpgDec.drawJpg(g_jpgX, g_jpgY, g_imageBuf, g_imageSize);
@@ -509,14 +532,53 @@ static bool decodeBand(int16_t top, int16_t bottom) {
 
   g_clipTop = 0;
   g_clipBot = DISPLAY_H;
+  g_reveal  = false;
   if (r != JDR_OK) { Serial.printf("JPEG: decode err %d\n", (int)r); return false; }
   return true;
 }
 
 static bool renderAlbumArt() {
-  const bool ok = decodeBand(0, DISPLAY_H);
-  if (ok) Serial.printf("JPEG: rendered %ux scale, art at %d,%d\n", 1, g_jpgX, g_jpgY);
+  const bool ok = decodeBand(0, DISPLAY_H, /*reveal=*/true);
+  if (ok) Serial.printf("JPEG: rendered, art at %d,%d\n", g_jpgX, g_jpgY);
   return ok;
+}
+
+// =====================================================================
+//  Waiting state: animated loading spinner instead of a blank screen
+// =====================================================================
+static const char *g_waitLabel = nullptr;   // current waiting label (nullptr => not waiting)
+
+static void clearWaiting() { g_waitLabel = nullptr; }   // call once art is shown
+
+static void serviceWaiting(const char *label) {
+  static float    ang  = 0.0f;
+  static uint32_t last = 0;
+  if (label != g_waitLabel) {                // new state -> repaint background + label
+    g_waitLabel = label;
+    tft.fillScreen(TFT_BLACK);
+    tft.setTextDatum(middle_center);
+    tft.setFont(&fonts::FreeSans9pt7b);
+    tft.setTextColor(tft.color565(150, 150, 150), TFT_BLACK);
+    tft.drawString(label, CX, CY + 60);
+  }
+  if (millis() - last < SPIN_INTERVAL_MS) return;
+  last = millis();
+  const int r0 = 26, r1 = 34;                // small centered loader ring
+  tft.fillArc(CX, CY, r0, r1, 0, 360, tft.color565(28, 28, 28));
+  tft.fillArc(CX, CY, r0, r1, ang, ang + 80, tft.color565(0x1D, 0xB9, 0x54));
+  ang += 11;
+  if (ang >= 360) ang -= 360;
+}
+
+// Poll faster while waiting for music or when the current track is about to end,
+// so a new song shows up in ~1.5 s instead of after the full 8 s poll cycle.
+static uint32_t pollInterval(bool haveArt) {
+  if (!haveArt) return POLL_FAST_MS;
+  if (g_durationMs > 0) {
+    const uint32_t est = g_progressMs + (millis() - g_progressStampMs);
+    if (est + NEAR_END_MS >= g_durationMs) return POLL_FAST_MS;
+  }
+  return POLL_INTERVAL_MS;
 }
 
 // =====================================================================
@@ -547,73 +609,72 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastPoll      = 0;
-  static uint32_t lastRing      = 0;
-  static uint32_t overlayUntil  = 0;
-  static bool     showedNothing = false;
-  static bool     haveArt       = false;
+  static uint32_t lastPoll     = 0;
+  static uint32_t lastRing     = 0;
+  static uint32_t overlayUntil = 0;
+  static bool     haveArt      = false;
+  static const char *waitMsg   = "Waiting for music";
 
   if (!ensureWifi()) {
-    showStatus("No Wi-Fi", "Retrying...");
     haveArt = false;
+    serviceWaiting("Connecting Wi-Fi");
+    delay(10);
     return;
   }
 
-  // --- Poll Spotify on the configured cadence ---
-  if (lastPoll == 0 || millis() - lastPoll >= POLL_INTERVAL_MS) {
+  // --- Poll Spotify (cadence speeds up while waiting / near track end) ---
+  if (lastPoll == 0 || millis() - lastPoll >= pollInterval(haveArt)) {
     lastPoll = millis();
 
     if (!ensureToken()) {
-      showStatus("Spotify auth", "Retrying...");
       haveArt = false;
-      return;
-    }
+      waitMsg = "Connecting Spotify";
+    } else {
+      String trackId, albumUrl;
+      switch (fetchNowPlaying(trackId, albumUrl)) {
+        case NowPlaying::Error:
+          if (!haveArt) waitMsg = "Reconnecting";   // keep art on screen if we have it
+          break;
 
-    String trackId, albumUrl;
-    switch (fetchNowPlaying(trackId, albumUrl)) {
-      case NowPlaying::Error:
-        if (!haveArt) showStatus("Spotify", "Reconnecting...");
-        break;
-
-      case NowPlaying::Nothing:
-        if (!showedNothing) {
-          showStatus("Nothing playing", "Open Spotify");
-          showedNothing = true;
+        case NowPlaying::Nothing:
           haveArt = false;
           g_lastTrackId = "";
-        }
-        break;
+          waitMsg = "Waiting for music";
+          break;
 
-      case NowPlaying::Track:
-        showedNothing = false;
-        if (trackId != g_lastTrackId) {       // new track -> fetch + render
-          if (downloadImage(albumUrl) && renderAlbumArt()) {
-            g_lastTrackId = trackId;
-            haveArt = true;
-            drawInfoOverlay();                // show song / artist
-            overlayUntil = millis() + OVERLAY_MS;
-            Serial.printf("Rendered: %s — %s\n", g_trackName.c_str(), g_artistName.c_str());
-          } else {
-            showStatus("Art unavailable", "");
-            haveArt = false;
+        case NowPlaying::Track:
+          if (trackId != g_lastTrackId) {           // new track -> fetch + wipe in
+            if (downloadImage(albumUrl) && renderAlbumArt()) {
+              g_lastTrackId = trackId;
+              haveArt = true;
+              clearWaiting();
+              drawInfoOverlay();                     // show song / artist
+              overlayUntil = millis() + OVERLAY_MS;
+              Serial.printf("Rendered: %s — %s\n", g_trackName.c_str(), g_artistName.c_str());
+            } else {
+              haveArt = false;
+              waitMsg = "Art unavailable";
+            }
           }
-        }
-        break;
+          break;
+      }
     }
   }
 
-  // --- Auto-clear the overlay by re-decoding only the bottom band ---
-  if (haveArt && overlayUntil && millis() >= overlayUntil) {
-    overlayUntil = 0;
-    decodeBand(BAND_TOP, DISPLAY_H);          // restore art under the text
-    if (g_durationMs > 0) ringFull(currentRatio());
-  }
-
-  // --- Animate the progress ring (only while art is clean of the overlay) ---
-  if (haveArt && !overlayUntil && g_durationMs > 0 &&
-      millis() - lastRing >= RING_INTERVAL_MS) {
-    lastRing = millis();
-    ringUpdate(currentRatio());
+  if (haveArt) {
+    // Auto-clear the overlay by re-decoding only the bottom band.
+    if (overlayUntil && millis() >= overlayUntil) {
+      overlayUntil = 0;
+      decodeBand(BAND_TOP, DISPLAY_H);
+      if (g_durationMs > 0) ringFull(currentRatio());
+    }
+    // Animate the progress ring (only while art is clean of the overlay).
+    if (!overlayUntil && g_durationMs > 0 && millis() - lastRing >= RING_INTERVAL_MS) {
+      lastRing = millis();
+      ringUpdate(currentRatio());
+    }
+  } else {
+    serviceWaiting(waitMsg);                          // animated spinner, no blank screen
   }
 
   delay(10);
